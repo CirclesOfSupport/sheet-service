@@ -205,32 +205,45 @@ def read():
 @app.route("/write", methods=["POST"])
 def write():
     """
-    Write a row to a Google Sheet.
+    Write to a Google Sheet. Supports two modes:
 
-    Finds the next functionally-empty row by checking the key column for a blank
-    value — this correctly handles sheets with array formulas or dropdown lists
-    that would otherwise cause the naive "find last non-empty row" approach to
-    write far below the real data.
+    APPEND (newrow=yes): Appends a new row. Finds the next functionally-empty
+    row by scanning the key column for a blank value — correctly handles sheets
+    with array formulas or dropdown lists.
+
+    UPDATE (newrow=no): Finds an existing row where the key column matches the
+    key value, then writes only the specified columns into that row.
+
+    The payload format mirrors the existing Apps Script convention: data columns
+    are sent flat in the body alongside metadata fields. Reserved fields
+    (password, sheetid, tab, newrow, rewrite, key, prepend) are stripped out;
+    everything else is treated as column → value pairs to write.
 
     Request body (JSON):
     {
         "password": "...",
         "sheetid": "<Google Sheet ID>",
         "tab": "<Tab Name>",
-        "key": "<column header>",       // used to locate the next empty row
-        "data": {                        // column → value pairs to write
-            "Column Header 1": "value1",
-            "Column Header 2": "value2"
-        },
-        "prepend": false                 // optional: insert at row 2 (top) instead of bottom
+        "newrow": "yes" | "no",          // "yes" = append, "no" = update existing
+        "key": "<column header>",        // key column name
+        "<key>": "<value>",              // key value (used for update mode lookup,
+                                         // and also written to the row in append mode)
+        "Column Header 1": "value1",     // data columns to write (flat, not nested)
+        "Column Header 2": "value2",
+        "rewrite": "no",                 // accepted but ignored (legacy compat)
+        "prepend": false                 // append mode only: insert at top instead of bottom
     }
 
     Response:
     {
         "status": "success",
-        "row": <row number written>
+        "row": <row number written>,
+        "matched": <number of rows updated>  // update mode only
     }
     """
+    # Fields that are not data columns
+    RESERVED = {"password", "sheetid", "tab", "newrow", "rewrite", "key", "prepend"}
+
     body = request.get_json(force=True, silent=True) or {}
 
     if not check_password(body):
@@ -239,15 +252,23 @@ def write():
     sheet_id = body.get("sheetid")
     tab = body.get("tab")
     key_col = body.get("key")
-    data = body.get("data")
+    newrow = str(body.get("newrow", "yes")).lower()
     prepend = body.get("prepend", False)
 
     if not sheet_id or not tab:
         return jsonify({"status": "error", "message": "sheetid and tab are required"}), 400
     if not key_col:
         return jsonify({"status": "error", "message": "key is required"}), 400
-    if not isinstance(data, dict) or not data:
-        return jsonify({"status": "error", "message": "data must be a non-empty object"}), 400
+
+    # key_col may be a list in some legacy payloads — normalise to string
+    if isinstance(key_col, list):
+        key_col = key_col[0]
+
+    # Extract data columns: everything not in RESERVED
+    data = {k: v for k, v in body.items() if k not in RESERVED}
+
+    if not data:
+        return jsonify({"status": "error", "message": "No data columns found in request body"}), 400
 
     try:
         service = get_sheets_client()
@@ -257,9 +278,64 @@ def write():
 
         key_col_index = find_key_col_index(headers, key_col)
 
+        # ------------------------------------------------------------------
+        # UPDATE MODE: find existing row(s) by key and patch columns in place
+        # ------------------------------------------------------------------
+        if newrow == "no":
+            key_value = str(data.get(key_col, "")).strip()
+            if not key_value:
+                return jsonify({"status": "error", "message": f"Key value for '{key_col}' not found in body"}), 400
+
+            # Fetch key column to find matching rows
+            col = col_letter(key_col_index + 1)
+            range_name = f"'{tab}'!{col}2:{col}100000"
+            result = service.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=range_name,
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+            key_values = result.get("values", [])
+
+            matched_rows = []
+            for i, row in enumerate(key_values):
+                cell = str(row[0]).strip() if row else ""
+                if cell == key_value:
+                    matched_rows.append(i + 2)  # 1-based, skip header
+
+            if not matched_rows:
+                return jsonify({"status": "error", "message": f"No row found where '{key_col}' = '{key_value}'"}), 404
+
+            # For each matched row, write only the data columns that exist in headers
+            # Use individual cell updates to avoid overwriting columns we're not touching
+            value_updates = []
+            for target_row in matched_rows:
+                for col_name, value in data.items():
+                    try:
+                        col_idx = find_key_col_index(headers, col_name)
+                        cell_range = f"'{tab}'!{col_letter(col_idx + 1)}{target_row}"
+                        value_updates.append({
+                            "range": cell_range,
+                            "values": [[value]]
+                        })
+                    except ValueError:
+                        logger.warning("Column '%s' not found in headers — skipping", col_name)
+
+            if value_updates:
+                service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=sheet_id,
+                    body={
+                        "valueInputOption": "USER_ENTERED",
+                        "data": value_updates,
+                    },
+                ).execute()
+
+            return jsonify({"status": "success", "matched": len(matched_rows), "rows": matched_rows}), 200
+
+        # ------------------------------------------------------------------
+        # APPEND MODE: write a new row
+        # ------------------------------------------------------------------
         if prepend:
             target_row = 2
-            # Insert a blank row at row 2, pushing existing data down
             service.spreadsheets().batchUpdate(
                 spreadsheetId=sheet_id,
                 body={
@@ -268,7 +344,7 @@ def write():
                             "range": {
                                 "sheetId": _get_sheet_gid(service, sheet_id, tab),
                                 "dimension": "ROWS",
-                                "startIndex": 1,  # 0-based; row 2 in UI
+                                "startIndex": 1,
                                 "endIndex": 2,
                             },
                             "inheritFromBefore": False,
@@ -279,7 +355,7 @@ def write():
         else:
             target_row = find_next_empty_row(service, sheet_id, tab, key_col_index)
 
-        # Build the row array aligned to header positions
+        # Build full row array aligned to header positions
         row_values = [""] * len(headers)
         for col_name, value in data.items():
             try:
