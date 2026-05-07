@@ -2,7 +2,6 @@ import os
 import json
 import logging
 from flask import Flask, request, jsonify
-from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -18,20 +17,28 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 def get_sheets_client():
-    """Build a Google Sheets API client.
+    """Build a Google Sheets API client using OAuth refresh token.
 
-    Credentials are resolved in this order:
-      1. GOOGLE_APPLICATION_CREDENTIALS env var (path to a service account JSON file)
-      2. Application Default Credentials (used automatically on Cloud Run)
+    Authenticates as the user who authorized the app (logan@circlesofsupport.net),
+    so all sheets accessible to that user are accessible to this service.
+
+    Required environment variables:
+      OAUTH_CLIENT_ID      - OAuth 2.0 client ID
+      OAUTH_CLIENT_SECRET  - OAuth 2.0 client secret
+      OAUTH_REFRESH_TOKEN  - Refresh token obtained via OAuth Playground
     """
-    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if creds_path:
-        creds = service_account.Credentials.from_service_account_file(
-            creds_path, scopes=SCOPES
-        )
-    else:
-        import google.auth
-        creds, _ = google.auth.default(scopes=SCOPES)
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    creds = Credentials(
+        token=None,
+        refresh_token=os.environ.get("OAUTH_REFRESH_TOKEN"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.environ.get("OAUTH_CLIENT_ID"),
+        client_secret=os.environ.get("OAUTH_CLIENT_SECRET"),
+        scopes=SCOPES,
+    )
+    creds.refresh(Request())
     return build("sheets", "v4", credentials=creds)
 
 
