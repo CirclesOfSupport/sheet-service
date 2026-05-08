@@ -1,6 +1,6 @@
 # sheet-service
 
-Cloud Run service that provides generic Google Sheets read and write functionality. Replaces the `@globals.googleappscriptreadfromsheeturl` Apps Script webhook and the `sheet-service-v2` Cloud Function.
+Cloud Run service that provides generic Google Sheets read and write functionality. Replaces the `@globals.googleappscriptreadfromsheeturl` and `@globals.googleappscriptwritetospreadsheeturl` Apps Script webhooks.
 
 ## Endpoints
 
@@ -43,7 +43,7 @@ Read rows from a Google Sheet by key/value match.
 
 ### `POST /write`
 
-Write a row to a Google Sheet. Finds the next functionally-empty row by scanning the key column for a blank value, which correctly handles sheets with array formulas or dropdown validation lists.
+Write to a Google Sheet. Supports append and update modes.
 
 **Request:**
 ```json
@@ -51,24 +51,36 @@ Write a row to a Google Sheet. Finds the next functionally-empty row by scanning
     "password": "...",
     "sheetid": "<Google Sheet ID>",
     "tab": "<Tab Name>",
-    "key": "<column header used to find next empty row>",
-    "data": {
-        "Column Header 1": "value1",
-        "Column Header 2": "value2"
-    },
+    "newrow": "yes",
+    "key": "<column header>",
+    "<key>": "<value>",
+    "Column Header 1": "value1",
+    "Column Header 2": "value2",
     "prepend": false
 }
 ```
 
-- `key` specifies which column to scan when finding the next empty row. Use your primary identifier column (e.g. UUID, ID, Name).
-- `prepend: true` inserts a new row at the top (row 2, just below the header) and pushes existing data down. Useful for append-to-top patterns.
+Data columns go flat in the body alongside the metadata fields -- there is no `data` wrapper.
+
+- `newrow: "yes"` -- append a new row. Finds the next functionally-empty row by scanning the key column for a blank value, which correctly handles sheets with array formulas or dropdown validation lists.
+- `newrow: "no"` -- find an existing row where the key column matches the key value and update only the specified columns in place.
+- `prepend: true` -- append mode only. Inserts at row 2 (top of data, below header) and pushes existing rows down. Defaults to `false`.
 - Column matching is case-insensitive.
 
-**Response:**
+**Append response:**
 ```json
 {
     "status": "success",
     "row": 47
+}
+```
+
+**Update response:**
+```json
+{
+    "status": "success",
+    "matched": 1,
+    "rows": [47]
 }
 ```
 
@@ -82,18 +94,18 @@ Deploys automatically to Cloud Run on push to `main` via Cloud Build trigger. Re
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `SHEET_SERVICE_PASSWORD` | Yes | Shared secret; set in Cloud Run env vars. Same value as existing Apps Script password. |
-| `GOOGLE_APPLICATION_CREDENTIALS` | No | Path to service account JSON. Not needed on Cloud Run — ADC is used automatically. |
-
-## Credentials
-
-On Cloud Run the service account attached to the Cloud Run service must have **Google Sheets API** access for the sheets it needs to read/write. Grant the service account `roles/sheets.editor` on the relevant sheets, or use domain-wide delegation if all sheets are in the same Workspace org.
+| `SHEET_SERVICE_PASSWORD` | Yes | Shared secret for request authentication. |
+| `OAUTH_CLIENT_ID` | Yes | OAuth 2.0 client ID for Google Sheets access. |
+| `OAUTH_CLIENT_SECRET` | Yes | OAuth 2.0 client secret. |
+| `OAUTH_REFRESH_TOKEN` | Yes | Refresh token authorizing Sheets access. |
 
 ## Local development
 
 ```bash
-pip install -r src/requirements.txt
-export SHEET_SERVICE_PASSWORD="WhoWhatNow?42?!"
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/sa.json"
+pip install -r requirements.txt
+export SHEET_SERVICE_PASSWORD="..."
+export OAUTH_CLIENT_ID="..."
+export OAUTH_CLIENT_SECRET="..."
+export OAUTH_REFRESH_TOKEN="..."
 python src/main.py
 ```
