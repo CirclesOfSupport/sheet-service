@@ -80,18 +80,22 @@ def find_key_col_index(headers: list[str], key_col: str) -> int:
 
 def segment_value(value: str, result_name: str, max_chars: int = 500) -> dict:
     """
-    Reproduce the Apps Script 'Fetch' doPost segmentation.
+    Reproduce the Apps Script 'Fetch' doPost segmentation, including its quirks.
 
-    Split the cell on blank lines OR immediately before a '(N) ' marker
-    (regex: \\n\\s*\\n  |  (?=\\(\\d+\\)\\s) ), trim each section, drop empties,
-    then pack sections into <= max_chars segments. When two sections pack into
-    the same segment they are rejoined with a BLANK LINE ("\\n\\n") -- the Apps
-    Script preserves the blank-line separator, so a single-"\\n" join leaves the
-    segment one char short per boundary. Verified against the live endpoint
-    (demostudent/sleep, 2026-06-18): one section pair, one segment, _1 must equal
-    the unsuffixed value byte-for-byte (266 chars, not 265).
+    Split the cell on blank lines OR immediately before a '(N) ' marker, trim
+    each resulting section. The Apps Script does NOT discard an empty section
+    that sits alongside non-empty ones -- a cell with a leading blank line
+    ("\n\n" + text) yields an empty first segment and the text as the second
+    (segments=2, _1="", _2=text). Verified against the live resource_map_webapp
+    wsu EmailsOutreachRecommendation cell (2026-06-18). Only when EVERY section
+    is empty (an empty/whitespace cell) are there zero segments -- matching the
+    live empty-cell response (value "", _segments 0, no _1).
 
-    A single section longer than max_chars is hard-split into max_chars pieces.
+    Packing: adjacent NON-empty sections join with a blank line while they fit
+    within max_chars; an empty section is never merged and stands as its own
+    segment; a single section longer than max_chars is hard-split into max_chars
+    pieces. A single-segment value is byte-for-byte identical to the unsuffixed
+    value (verified demostudent/sleep, 266 chars).
 
     Emits:
       <result_name>            -> full original value
@@ -101,29 +105,33 @@ def segment_value(value: str, result_name: str, max_chars: int = 500) -> dict:
     text = value if value is not None else ""
     out = {result_name: text}
 
-    sections = re.split(r"\n\s*\n|(?=\(\d+\)\s)", text)
-    sections = [s.strip() for s in sections if s is not None and s.strip() != ""]
+    parts = re.split(r"\n\s*\n|(?=\(\d+\)\s)", text)
+    sections = [p.strip() for p in parts]
+
+    if all(s == "" for s in sections):
+        out[f"{result_name}_segments"] = 0
+        return out
 
     segments = []
-    current = ""
+    current = None
     for section in sections:
         if len(section) > max_chars:
-            if current:
+            if current is not None:
                 segments.append(current)
-                current = ""
+                current = None
             for i in range(0, len(section), max_chars):
                 segments.append(section[i:i + max_chars])
             continue
 
-        if current == "":
+        if current is None:
             current = section
-        elif len(current) + 2 + len(section) <= max_chars:
+        elif current != "" and section != "" and len(current) + 2 + len(section) <= max_chars:
             current = current + "\n\n" + section
         else:
             segments.append(current)
             current = section
 
-    if current:
+    if current is not None:
         segments.append(current)
 
     for i, seg in enumerate(segments):
