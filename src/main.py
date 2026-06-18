@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 from flask import Flask, request, jsonify
@@ -75,6 +76,58 @@ def find_key_col_index(headers: list[str], key_col: str) -> int:
         if h.strip().lower() == key_col.strip().lower():
             return i
     raise ValueError(f"Key column '{key_col}' not found in headers: {headers}")
+
+
+def segment_value(value: str, result_name: str, max_chars: int = 500) -> dict:
+    """
+    Reproduce the Apps Script 'Fetch' doPost segmentation exactly.
+
+    1. Split the cell content on blank lines OR immediately before a '(N) ' marker
+       (regex: \\n\\s*\\n  |  (?=\\(\\d+\\)\\s) ).
+    2. Trim each section, drop empties.
+    3. Pack sections into segments of <= max_chars, never splitting across a
+       section boundary unless a single section itself exceeds max_chars (in
+       which case that section is hard-split into max_chars-sized pieces).
+    4. Emit:
+         <result_name>            -> full original value
+         <result_name>_<n>        -> 1-based segment text
+         <result_name>_segments   -> integer count of segments
+
+    Mirrors Code.gs behavior documented in resource_map_webapp_internal.md so the
+    downstream Fetch Resources V4 nodes (which read _1/_2/_segments) keep working.
+    """
+    out = {result_name: value}
+
+    sections = re.split(r"\n\s*\n|(?=\(\d+\)\s)", value if value is not None else "")
+    sections = [s.strip() for s in sections if s is not None and s.strip() != ""]
+
+    segments = []
+    current = ""
+    for section in sections:
+        if len(section) > max_chars:
+            # Flush whatever is buffered, then hard-split the oversize section.
+            if current:
+                segments.append(current)
+                current = ""
+            for i in range(0, len(section), max_chars):
+                segments.append(section[i:i + max_chars])
+            continue
+
+        if current == "":
+            current = section
+        elif len(current) + 1 + len(section) <= max_chars:
+            current = current + "\n" + section
+        else:
+            segments.append(current)
+            current = section
+
+    if current:
+        segments.append(current)
+
+    for i, seg in enumerate(segments):
+        out[f"{result_name}_{i + 1}"] = seg
+    out[f"{result_name}_segments"] = len(segments)
+    return out
 
 
 def find_next_empty_row(service, sheet_id: str, tab: str, key_col_index: int) -> int:
@@ -206,6 +259,145 @@ def read():
         return jsonify({"status": "error", "message": str(e)}), 502
     except Exception as e:
         logger.exception("Unexpected error in /read")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/coordinates", methods=["POST"])
+def coordinates():
+    """
+    Column x row INTERSECTION lookup with segmentation -- mirrors the legacy
+    'Fetch' Apps Script doPost (resource_map_webapp_internal) so Fetch Resources
+    V4 can re-point here by URL only, with no change to its request body or to
+    the downstream nodes that consume the segmented response.
+
+    Request body (JSON) -- identical to the Apps Script contract, plus sheetid:
+    {
+        "password": "WhoWhatNow?42?!",
+        "sheetid": "<Google Sheet ID>",   // see note below
+        "coordinates": [
+            {
+                "sheet": "<Tab Name>",
+                "column": "<column header, case-insensitive>",
+                "row": "<row key in first column, case-insensitive>" OR "_<N>"
+                       for a 1-based literal row index,
+                "result_name": "<key to return the cell value under>"
+            }
+        ]
+    }
+
+    sheetid: the Apps Script used its BOUND spreadsheet and took no sheetid.
+    Cloud Run has no 'active' spreadsheet, so the canonical resource sheet id
+    must be supplied -- in the body as "sheetid", or via the RESOURCE_SHEET_ID
+    env var as a default. This is the ONE contract addition vs. the Apps Script.
+
+    Per-coordinate resolution matches Code.gs exactly:
+      - Column: case-insensitive findIndex over the first row.
+                Miss -> "Column value not found." under result_name.
+      - Row: '_N' -> 1-based literal row index; else case-insensitive findIndex
+             over the entire first column. Miss -> "Row value not found."
+      - Single cell at (row, column), then segment_value() (MAX=500), producing
+        result_name, result_name_<n>, result_name_segments.
+
+    Apps-Script-parity behaviors:
+      - A row/column miss is NOT an HTTP error: HTTP 200, miss string segmented
+        under result_name (so a content miss is body-distinguishable only, never
+        by status -- same as before).
+      - Bad password returns 403 (this service's convention). The flow sends the
+        correct password, so production never hits this path.
+
+    Response: HTTP 200, flat JSON merging every coordinate's segmented keys.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+
+    if not check_password(body):
+        return jsonify({"status": "error", "message": "Unauthorized"}), 403
+
+    coords = body.get("coordinates")
+    if isinstance(coords, dict):
+        coords = [coords]  # Apps Script normalised a single object to an array
+    if not isinstance(coords, list):
+        return jsonify({"status": "error", "message": "coordinates array is required"}), 400
+
+    sheet_id = body.get("sheetid") or os.environ.get("RESOURCE_SHEET_ID")
+    if not sheet_id:
+        return jsonify({
+            "status": "error",
+            "message": "sheetid not provided and RESOURCE_SHEET_ID not configured",
+        }), 400
+
+    try:
+        service = get_sheets_client()
+        response = {}
+        grid_cache = {}
+
+        def get_grid(tab_name: str):
+            if tab_name not in grid_cache:
+                rng = f"'{tab_name}'!A1:ZZ"
+                res = service.spreadsheets().values().get(
+                    spreadsheetId=sheet_id,
+                    range=rng,
+                    valueRenderOption="FORMATTED_VALUE",
+                ).execute()
+                grid_cache[tab_name] = res.get("values", [])
+            return grid_cache[tab_name]
+
+        for coord in coords:
+            tab = coord.get("sheet")
+            column = coord.get("column")
+            row_key = coord.get("row")
+            result_name = coord.get("result_name")
+
+            if not result_name:
+                continue
+
+            grid = get_grid(tab) if tab else []
+            if not grid:
+                response.update(segment_value(
+                    "Error processing request: sheet not found or empty", result_name))
+                continue
+
+            first_row = [str(c) for c in grid[0]]
+            col_idx = next(
+                (i for i, h in enumerate(first_row)
+                 if h.strip().lower() == str(column).strip().lower()),
+                -1,
+            )
+            if col_idx == -1:
+                response.update(segment_value("Column value not found.", result_name))
+                continue
+
+            row_idx = -1
+            rk = str(row_key) if row_key is not None else ""
+            if rk.startswith("_"):
+                try:
+                    literal = int(rk[1:])
+                    if 1 <= literal <= len(grid):
+                        row_idx = literal - 1
+                except ValueError:
+                    row_idx = -1
+            else:
+                first_col = [str(r[0]) if len(r) > 0 else "" for r in grid]
+                row_idx = next(
+                    (i for i, v in enumerate(first_col)
+                     if v.strip().lower() == rk.strip().lower()),
+                    -1,
+                )
+
+            if row_idx == -1:
+                response.update(segment_value("Row value not found.", result_name))
+                continue
+
+            target = grid[row_idx]
+            cell = str(target[col_idx]) if col_idx < len(target) else ""
+            response.update(segment_value(cell, result_name))
+
+        return jsonify(response), 200
+
+    except HttpError as e:
+        logger.exception("Google Sheets API error in /coordinates")
+        return jsonify({"status": "error", "message": str(e)}), 502
+    except Exception as e:
+        logger.exception("Unexpected error in /coordinates")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
