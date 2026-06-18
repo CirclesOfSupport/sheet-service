@@ -80,32 +80,34 @@ def find_key_col_index(headers: list[str], key_col: str) -> int:
 
 def segment_value(value: str, result_name: str, max_chars: int = 500) -> dict:
     """
-    Reproduce the Apps Script 'Fetch' doPost segmentation exactly.
+    Reproduce the Apps Script 'Fetch' doPost segmentation.
 
-    1. Split the cell content on blank lines OR immediately before a '(N) ' marker
-       (regex: \\n\\s*\\n  |  (?=\\(\\d+\\)\\s) ).
-    2. Trim each section, drop empties.
-    3. Pack sections into segments of <= max_chars, never splitting across a
-       section boundary unless a single section itself exceeds max_chars (in
-       which case that section is hard-split into max_chars-sized pieces).
-    4. Emit:
-         <result_name>            -> full original value
-         <result_name>_<n>        -> 1-based segment text
-         <result_name>_segments   -> integer count of segments
+    Split the cell on blank lines OR immediately before a '(N) ' marker
+    (regex: \\n\\s*\\n  |  (?=\\(\\d+\\)\\s) ), trim each section, drop empties,
+    then pack sections into <= max_chars segments. When two sections pack into
+    the same segment they are rejoined with a BLANK LINE ("\\n\\n") -- the Apps
+    Script preserves the blank-line separator, so a single-"\\n" join leaves the
+    segment one char short per boundary. Verified against the live endpoint
+    (demostudent/sleep, 2026-06-18): one section pair, one segment, _1 must equal
+    the unsuffixed value byte-for-byte (266 chars, not 265).
 
-    Mirrors Code.gs behavior documented in resource_map_webapp_internal.md so the
-    downstream Fetch Resources V4 nodes (which read _1/_2/_segments) keep working.
+    A single section longer than max_chars is hard-split into max_chars pieces.
+
+    Emits:
+      <result_name>            -> full original value
+      <result_name>_<n>        -> 1-based segment text
+      <result_name>_segments   -> integer count of segments
     """
-    out = {result_name: value}
+    text = value if value is not None else ""
+    out = {result_name: text}
 
-    sections = re.split(r"\n\s*\n|(?=\(\d+\)\s)", value if value is not None else "")
+    sections = re.split(r"\n\s*\n|(?=\(\d+\)\s)", text)
     sections = [s.strip() for s in sections if s is not None and s.strip() != ""]
 
     segments = []
     current = ""
     for section in sections:
         if len(section) > max_chars:
-            # Flush whatever is buffered, then hard-split the oversize section.
             if current:
                 segments.append(current)
                 current = ""
@@ -115,8 +117,8 @@ def segment_value(value: str, result_name: str, max_chars: int = 500) -> dict:
 
         if current == "":
             current = section
-        elif len(current) + 1 + len(section) <= max_chars:
-            current = current + "\n" + section
+        elif len(current) + 2 + len(section) <= max_chars:
+            current = current + "\n\n" + section
         else:
             segments.append(current)
             current = section
@@ -290,13 +292,17 @@ def coordinates():
     must be supplied -- in the body as "sheetid", or via the RESOURCE_SHEET_ID
     env var as a default. This is the ONE contract addition vs. the Apps Script.
 
-    Per-coordinate resolution matches Code.gs exactly:
+    Per-coordinate resolution matches Code.gs:
       - Column: case-insensitive findIndex over the first row.
-                Miss -> "Column value not found." under result_name.
+                Miss -> the coordinate's keys are OMITTED from the response.
       - Row: '_N' -> 1-based literal row index; else case-insensitive findIndex
-             over the entire first column. Miss -> "Row value not found."
+             over the entire first column. Miss -> keys OMITTED.
       - Single cell at (row, column), then segment_value() (MAX=500), producing
         result_name, result_name_<n>, result_name_segments.
+
+    On a lookup miss the live Apps Script does NOT return an error string under
+    the result_name -- it omits that key (an all-miss request returns `{}`).
+    Verified against the live endpoint 2026-06-18.
 
     Apps-Script-parity behaviors:
       - A row/column miss is NOT an HTTP error: HTTP 200, miss string segmented
@@ -352,8 +358,7 @@ def coordinates():
 
             grid = get_grid(tab) if tab else []
             if not grid:
-                response.update(segment_value(
-                    "Error processing request: sheet not found or empty", result_name))
+                # Apps Script omits the key on a failed lookup; do the same.
                 continue
 
             first_row = [str(c) for c in grid[0]]
@@ -363,7 +368,7 @@ def coordinates():
                 -1,
             )
             if col_idx == -1:
-                response.update(segment_value("Column value not found.", result_name))
+                # Column miss -> omit the key (matches live Apps Script behavior).
                 continue
 
             row_idx = -1
@@ -384,7 +389,7 @@ def coordinates():
                 )
 
             if row_idx == -1:
-                response.update(segment_value("Row value not found.", result_name))
+                # Row miss -> omit the key (matches live Apps Script behavior).
                 continue
 
             target = grid[row_idx]
