@@ -24,6 +24,7 @@ steps:
       - --port=8080
       - --min-instances=0
       - --concurrency=50
+      - --update-env-vars=RESOURCE_SHEET_ID=1NlbdL1UxeFD-0Vog6TU-vecOfUE4jvbWVIhsrIlTrqw
 
 options:
   logging: CLOUD_LOGGING_ONLY
