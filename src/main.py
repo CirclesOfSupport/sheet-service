@@ -79,24 +79,29 @@ def find_key_col_index(headers: list[str], key_col: str) -> int:
 
 
 def segment_value(value: str, result_name: str, max_chars: int = 500) -> dict:
-    r"""
-    Faithful port of the CANONICAL COPY sheet's doPost segmentation
-    (1NlbdL1U..., the "FIXED" Apps Script that becomes Live). Verified
-    byte-for-byte against that script's source and live output 2026-06-23.
+    """
+    Reproduce the CANONICAL (fixed) resource-map Apps Script segmentation EXACTLY.
 
-    Algorithm (exactly the Copy script):
-      sections = cellContent.split(/\n\s*\n|(?=\(\d+\)\s)/).map(trim).filter(Boolean)
-      -> split on blank lines OR before a "(N) " marker, trim each, DROP EMPTIES.
-      Then pack: join consecutive sections with a blank line ("\n\n") while the
-      candidate stays <= max_chars; a section longer than max_chars is hard-split
-      into max_chars pieces (each trimmed). Empty/whitespace cell -> 0 segments
-      (sections is empty, nothing is pushed).
+    Ported verbatim from the Copy sheet's doPost (the fixed version that the
+    migration targets), captured 2026-06-23:
 
-    NOTE: do NOT retain empty segments. An earlier build kept empty leading/
-    interior segments to match what the PRODUCTION sheet's OLD script emitted --
-    but that old script is broken (its regex `(?=$\d$)` never splits and it uses
-    a 160-char limit), and it is being retired. The Copy script filters empties,
-    so multi-item cells segment cleanly with no interleaved blanks.
+        sections = cellContent.split(<blank-line OR before (N) >)
+                              .map(s => s.trim())
+                              .filter(Boolean);     // empties DROPPED
+        // pack sections, joining with "\n\n", into <= MAX (500) segments;
+        // a section longer than MAX is hard-split into MAX-sized pieces.
+
+    Key point that bit an earlier version: the canonical script FILTERS OUT empty
+    sections (`.filter(Boolean)`). It does NOT keep an empty segment for blank
+    lines (leading or interior). An earlier "keep empty sections" attempt
+    produced _segments=11 with empty alternating _2/_4/_6... for multi-item
+    cells; that was wrong. Verified against wsu/sleep (5 numbered items ->
+    2 segments, 442 + 308 chars, no empties).
+
+    NOTE: production's OLD gmail-sheet script has a BROKEN regex that
+    matches nothing and returns ["", full_text] (segments=2, _1=""). We are NOT
+    matching that; we match the FIXED Copy script, which is the sheet being
+    migrated to and the intended behavior.
 
     Emits:
       <result_name>            -> full original value
@@ -106,7 +111,9 @@ def segment_value(value: str, result_name: str, max_chars: int = 500) -> dict:
     text = value if value is not None else ""
     out = {result_name: text}
 
-    sections = [s.strip() for s in re.split(r"\n\s*\n|(?=\(\d+\)\s)", text) if s.strip()]
+    parts = re.split(r"\n\s*\n|(?=\(\d+\)\s)", text)
+    sections = [p.strip() for p in parts]
+    sections = [p for p in sections if p]  # filter(Boolean) -- drop empties
 
     segments = []
     segment = ""
