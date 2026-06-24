@@ -79,23 +79,24 @@ def find_key_col_index(headers: list[str], key_col: str) -> int:
 
 
 def segment_value(value: str, result_name: str, max_chars: int = 500) -> dict:
-    """
-    Reproduce the Apps Script 'Fetch' doPost segmentation, including its quirks.
+    r"""
+    Faithful port of the CANONICAL COPY sheet's doPost segmentation
+    (1NlbdL1U..., the "FIXED" Apps Script that becomes Live). Verified
+    byte-for-byte against that script's source and live output 2026-06-23.
 
-    Split the cell on blank lines OR immediately before a '(N) ' marker, trim
-    each resulting section. The Apps Script does NOT discard an empty section
-    that sits alongside non-empty ones -- a cell with a leading blank line
-    ("\n\n" + text) yields an empty first segment and the text as the second
-    (segments=2, _1="", _2=text). Verified against the live resource_map_webapp
-    wsu EmailsOutreachRecommendation cell (2026-06-18). Only when EVERY section
-    is empty (an empty/whitespace cell) are there zero segments -- matching the
-    live empty-cell response (value "", _segments 0, no _1).
+    Algorithm (exactly the Copy script):
+      sections = cellContent.split(/\n\s*\n|(?=\(\d+\)\s)/).map(trim).filter(Boolean)
+      -> split on blank lines OR before a "(N) " marker, trim each, DROP EMPTIES.
+      Then pack: join consecutive sections with a blank line ("\n\n") while the
+      candidate stays <= max_chars; a section longer than max_chars is hard-split
+      into max_chars pieces (each trimmed). Empty/whitespace cell -> 0 segments
+      (sections is empty, nothing is pushed).
 
-    Packing: adjacent NON-empty sections join with a blank line while they fit
-    within max_chars; an empty section is never merged and stands as its own
-    segment; a single section longer than max_chars is hard-split into max_chars
-    pieces. A single-segment value is byte-for-byte identical to the unsuffixed
-    value (verified demostudent/sleep, 266 chars).
+    NOTE: do NOT retain empty segments. An earlier build kept empty leading/
+    interior segments to match what the PRODUCTION sheet's OLD script emitted --
+    but that old script is broken (its regex `(?=$\d$)` never splits and it uses
+    a 160-char limit), and it is being retired. The Copy script filters empties,
+    so multi-item cells segment cleanly with no interleaved blanks.
 
     Emits:
       <result_name>            -> full original value
@@ -105,34 +106,35 @@ def segment_value(value: str, result_name: str, max_chars: int = 500) -> dict:
     text = value if value is not None else ""
     out = {result_name: text}
 
-    parts = re.split(r"\n\s*\n|(?=\(\d+\)\s)", text)
-    sections = [p.strip() for p in parts]
-
-    if all(s == "" for s in sections):
-        out[f"{result_name}_segments"] = 0
-        return out
+    sections = [s.strip() for s in re.split(r"\n\s*\n|(?=\(\d+\)\s)", text) if s.strip()]
 
     segments = []
-    current = None
+    segment = ""
+
+    def push_with_hard_split(t):
+        while len(t) > max_chars:
+            segments.append(t[:max_chars].strip())
+            t = t[max_chars:]
+        if t.strip():
+            segments.append(t.strip())
+
     for section in sections:
         if len(section) > max_chars:
-            if current is not None:
-                segments.append(current)
-                current = None
-            for i in range(0, len(section), max_chars):
-                segments.append(section[i:i + max_chars])
+            if segment.strip():
+                segments.append(segment.strip())
+            segment = ""
+            push_with_hard_split(section)
             continue
-
-        if current is None:
-            current = section
-        elif current != "" and section != "" and len(current) + 2 + len(section) <= max_chars:
-            current = current + "\n\n" + section
+        candidate = (segment + "\n\n" + section) if segment else section
+        if len(candidate) > max_chars:
+            if segment.strip():
+                segments.append(segment.strip())
+            segment = section
         else:
-            segments.append(current)
-            current = section
+            segment = candidate
 
-    if current is not None:
-        segments.append(current)
+    if segment.strip():
+        segments.append(segment.strip())
 
     for i, seg in enumerate(segments):
         out[f"{result_name}_{i + 1}"] = seg
