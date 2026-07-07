@@ -48,6 +48,81 @@ def check_password(body: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# /coordinates grid cache (TTL, per-instance)
+# ---------------------------------------------------------------------------
+# Every /coordinates call reads an entire tab ('<tab>'!A1:ZZ) into memory and
+# resolves all column/row lookups against that in-memory grid. Without caching,
+# each call re-reads from the Sheets API. Under a cohort burst (many subscribers
+# entering a check-in flow at once, each firing Get Org Info / Offboarded /
+# Fetch Resources V4 -> /coordinates), this exhausts the Sheets API read quota:
+#   ReadRequestsPerMinutePerUser = 60, per-user (all reads bill to the single
+#   OAuth user), which returns HTTP 429 -> surfaced to TextIt as 502.
+# Confirmed 2026-07-06: an FSU-COM-PA cohort burst blew the 60/min ceiling.
+#
+# This cache holds each tab's grid keyed by (sheet_id, tab_name) for a short
+# TTL, collapsing a burst to ~1 Sheets read per distinct tab per TTL window.
+# The tabs read by /coordinates in production (Resources, SelfHelp, PastClients)
+# are static, human-edited config -- no flow writes-then-immediately-reads them
+# -- so a uniform TTL is safe. Staleness is bounded by the TTL: a manual sheet
+# edit becomes visible within COORDINATES_CACHE_TTL seconds.
+#
+# Per-instance: the cache lives in each Cloud Run instance's memory, so a burst
+# fanned across N instances yields ~N reads/tab/TTL, not 1 -- still a large
+# reduction, sufficient to stay under quota. A shared cache (Memorystore) is
+# unnecessary at this scale.
+#
+# Scope: /coordinates ONLY. /read and /write are unaffected.
+
+import time
+import threading
+
+COORDINATES_CACHE_TTL = int(os.environ.get("COORDINATES_CACHE_TTL", "300"))
+
+# key: (sheet_id, tab_name) -> (fetched_at_epoch, grid)
+_grid_cache: dict[tuple[str, str], tuple[float, list]] = {}
+_grid_cache_lock = threading.Lock()
+
+
+def get_cached_grid(service, sheet_id: str, tab_name: str, bypass: bool = False) -> list:
+    """Return the tab's grid ('<tab>'!A1:ZZ) from cache if fresh, else read it
+    from Sheets and refresh the cache.
+
+    The read + refresh is guarded by a lock so a concurrent burst for the same
+    tab triggers a single Sheets read (the first caller refreshes; the rest
+    reuse the freshly-cached grid) rather than a thundering herd of reads that
+    would itself spend quota.
+
+    bypass=True forces a fresh read (and refreshes the cache) -- used by the
+    request-level "nocache" flag to verify a sheet edit without waiting out
+    the TTL.
+    """
+    cache_key = (sheet_id, tab_name)
+    now = time.time()
+
+    if not bypass:
+        cached = _grid_cache.get(cache_key)
+        if cached is not None and (now - cached[0]) < COORDINATES_CACHE_TTL:
+            return cached[1]
+
+    with _grid_cache_lock:
+        # Re-check under lock: another thread may have refreshed while we waited.
+        if not bypass:
+            cached = _grid_cache.get(cache_key)
+            if cached is not None and (time.time() - cached[0]) < COORDINATES_CACHE_TTL:
+                return cached[1]
+
+        rng = f"'{tab_name}'!A1:ZZ"
+        res = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=rng,
+            valueRenderOption="FORMATTED_VALUE",
+        ).execute()
+        grid = res.get("values", [])
+        _grid_cache[cache_key] = (time.time(), grid)
+        return grid
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -309,6 +384,12 @@ def coordinates():
     must be supplied -- in the body as "sheetid", or via the RESOURCE_SHEET_ID
     env var as a default. This is the ONE contract addition vs. the Apps Script.
 
+    Tab grids are cached per-instance for COORDINATES_CACHE_TTL seconds (default
+    300) keyed by (sheet_id, tab) to stay under the Sheets API read quota under
+    burst load -- see the /coordinates grid cache section above. Optional body
+    flag "nocache": true forces a fresh read for that call (and refreshes the
+    cache), for verifying a sheet edit without waiting out the TTL.
+
     Per-coordinate resolution matches Code.gs:
       - Column: case-insensitive findIndex over the first row.
                 Miss -> the coordinate's keys are OMITTED from the response.
@@ -348,21 +429,25 @@ def coordinates():
             "message": "sheetid not provided and RESOURCE_SHEET_ID not configured",
         }), 400
 
+    # Optional per-request cache bypass: force a fresh Sheets read (and refresh
+    # the module cache) for this call. Lets an operator verify a sheet edit
+    # landed without waiting out the TTL. Accepts true / "true" (any case).
+    nocache = str(body.get("nocache", False)).strip().lower() == "true"
+
     try:
         service = get_sheets_client()
         response = {}
-        grid_cache = {}
+        # Per-request memo so a single request that references the same tab in
+        # multiple coordinates does exactly one cache lookup for it; the module
+        # cache (get_cached_grid) is what spans requests and bounds Sheets reads.
+        request_grids = {}
 
         def get_grid(tab_name: str):
-            if tab_name not in grid_cache:
-                rng = f"'{tab_name}'!A1:ZZ"
-                res = service.spreadsheets().values().get(
-                    spreadsheetId=sheet_id,
-                    range=rng,
-                    valueRenderOption="FORMATTED_VALUE",
-                ).execute()
-                grid_cache[tab_name] = res.get("values", [])
-            return grid_cache[tab_name]
+            if tab_name not in request_grids:
+                request_grids[tab_name] = get_cached_grid(
+                    service, sheet_id, tab_name, bypass=nocache
+                )
+            return request_grids[tab_name]
 
         for coord in coords:
             tab = coord.get("sheet")
