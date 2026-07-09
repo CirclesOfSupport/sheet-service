@@ -47,6 +47,28 @@ def check_password(body: dict) -> bool:
     return body.get("password") == PASSWORD
 
 
+def parse_body_or_400():
+    """
+    Parse the JSON request body, distinguishing an UNPARSEABLE body from a
+    genuinely empty one.
+
+    request.get_json(force=True, silent=True) returns None when the body is not
+    valid JSON (silent=True swallows the parse error). The previous
+    `get_json(...) or {}` pattern coerced that None to {}, so a malformed body
+    fell through to check_password({}) -> None == PASSWORD -> False -> 403
+    Unauthorized. A malformed body therefore masqueraded as an auth failure,
+    even when the correct password was present but unparsed (root cause of the
+    2026-07-09 NPS /write 403: an unescaped newline in subscriber free-text).
+
+    Returns (body, None) on success, or ({}, error_response) when the body did
+    not parse. Callers return error_response immediately when it is not None.
+    """
+    body = request.get_json(force=True, silent=True)
+    if body is None:
+        return {}, (jsonify({"status": "error", "message": "Invalid JSON"}), 400)
+    return body, None
+
+
 # ---------------------------------------------------------------------------
 # /coordinates grid cache (TTL, per-instance)
 # ---------------------------------------------------------------------------
@@ -283,7 +305,9 @@ def read():
         "rows": [{"_rowNumber": N, "col1": "val1", ...}]
     }
     """
-    body = request.get_json(force=True, silent=True) or {}
+    body, err = parse_body_or_400()
+    if err:
+        return err
 
     if not check_password(body):
         return jsonify({"status": "error", "message": "Unauthorized"}), 403
@@ -411,7 +435,9 @@ def coordinates():
 
     Response: HTTP 200, flat JSON merging every coordinate's segmented keys.
     """
-    body = request.get_json(force=True, silent=True) or {}
+    body, err = parse_body_or_400()
+    if err:
+        return err
 
     if not check_password(body):
         return jsonify({"status": "error", "message": "Unauthorized"}), 403
@@ -550,7 +576,9 @@ def write():
     # Fields that are not data columns
     RESERVED = {"password", "sheetid", "tab", "newrow", "rewrite", "key", "prepend"}
 
-    body = request.get_json(force=True, silent=True) or {}
+    body, err = parse_body_or_400()
+    if err:
+        return err
 
     if not check_password(body):
         return jsonify({"status": "error", "message": "Unauthorized"}), 403
