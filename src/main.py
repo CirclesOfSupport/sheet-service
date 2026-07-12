@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
-PASSWORD = os.environ.get("SHEET_SERVICE_PASSWORD", "WhoWhatNow?42?!")
+PASSWORD = os.environ.get("SHEET_SERVICE_PASSWORD", "<SYNC_PASSWORD>")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
@@ -390,7 +390,7 @@ def coordinates():
 
     Request body (JSON) -- identical to the Apps Script contract, plus sheetid:
     {
-        "password": "WhoWhatNow?42?!",
+        "password": "<SYNC_PASSWORD>",
         "sheetid": "<Google Sheet ID>",   // see note below
         "coordinates": [
             {
