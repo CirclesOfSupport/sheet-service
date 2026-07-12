@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
-PASSWORD = os.environ.get("SHEET_SERVICE_PASSWORD", "<SYNC_PASSWORD>")
+PASSWORD = os.environ.get("SHEET_SERVICE_PASSWORD", "")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
