@@ -11,9 +11,10 @@ Health check. Returns `{"status": "ok"}`.
 
 ### `POST /read`
 
-Read rows from a Google Sheet by key/value match.
+Read rows from a Google Sheet. Two modes: `match` (filter by key/value) and `all`
+(return every row).
 
-**Request:**
+**Request — `mode: "match"` (default):**
 ```json
 {
     "password": "...",
@@ -29,15 +30,37 @@ Read rows from a Google Sheet by key/value match.
 - `columns` is optional. Omit to return all columns.
 - The `<key>` field name must match the value of `key` — same as the existing Apps Script reader convention.
 
+**Request — `mode: "all"`:**
+```json
+{
+    "password": "...",
+    "sheetid": "<Google Sheet ID>",
+    "tab": "<Tab Name>",
+    "mode": "all",
+    "columns": ["col1"],
+    "limit": 100
+}
+```
+
+- Returns every row in the tab. `key` is not required and is ignored.
+- `columns` works the same as in match mode — use it to pull a single column cheaply.
+- `limit` is optional; caps the number of rows returned.
+- Useful for scanning or aggregating a column (e.g. taking `max()` of a timestamp
+  column to derive an incremental-ingest watermark).
+
 **Response:**
 ```json
 {
     "status": "success",
+    "mode": "match",
     "rows": [
         {"_rowNumber": 3, "col1": "val1", "col2": "val2"}
     ]
 }
 ```
+
+- `_rowNumber` is the 1-based sheet row.
+- An unknown mode returns `400 {"status":"error","message":"Unsupported mode: <x>"}`.
 
 ---
 
