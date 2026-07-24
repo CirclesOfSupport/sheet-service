@@ -293,10 +293,11 @@ def read():
         "password": "...",
         "sheetid": "<Google Sheet ID>",
         "tab": "<Tab Name>",
-        "mode": "match",              // only "match" supported for now
-        "key": "<column header>",     // column to match against
-        "<key>": "<value to match>",  // value to find (same key name as above)
-        "columns": ["col1", "col2"]   // optional: columns to return; omit for all
+        "mode": "match" | "all",      // "match" filters by key; "all" returns every row
+        "key": "<column header>",     // required for match mode; ignored for all
+        "<key>": "<value to match>",  // required for match mode (same key name as above)
+        "columns": ["col1", "col2"],  // optional: columns to return; omit for all columns
+        "limit": N                    // optional (all mode): cap rows returned
     }
 
     Response:
@@ -321,15 +322,16 @@ def read():
     if not sheet_id or not tab:
         return jsonify({"status": "error", "message": "sheetid and tab are required"}), 400
 
-    if mode != "match":
+    if mode not in ("match", "all"):
         return jsonify({"status": "error", "message": f"Unsupported mode: {mode}"}), 400
 
-    if not key_col:
-        return jsonify({"status": "error", "message": "key is required for match mode"}), 400
-
-    match_value = body.get(key_col)
-    if match_value is None:
-        return jsonify({"status": "error", "message": f"Match value for key '{key_col}' not provided"}), 400
+    match_value = None
+    if mode == "match":
+        if not key_col:
+            return jsonify({"status": "error", "message": "key is required for match mode"}), 400
+        match_value = body.get(key_col)
+        if match_value is None:
+            return jsonify({"status": "error", "message": f"Match value for key '{key_col}' not provided"}), 400
 
     try:
         service = get_sheets_client()
@@ -346,7 +348,7 @@ def read():
         ).execute()
         all_rows = result.get("values", [])
 
-        key_idx = find_key_col_index(headers, key_col)
+        key_idx = find_key_col_index(headers, key_col) if mode == "match" else None
 
         # Determine which column indices to return
         if return_cols:
@@ -359,16 +361,26 @@ def read():
         else:
             col_indices = [(h, i) for i, h in enumerate(headers)]
 
+        limit = body.get("limit")
+        try:
+            limit = int(limit) if limit is not None else None
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "limit must be an integer"}), 400
+
         matched = []
         for row_offset, row in enumerate(all_rows):
-            cell_val = str(row[key_idx]).strip() if key_idx < len(row) else ""
-            if cell_val == str(match_value).strip():
-                row_data = {"_rowNumber": row_offset + 2}  # 1-based, skip header
-                for col_name, idx in col_indices:
-                    row_data[col_name] = str(row[idx]) if idx < len(row) else ""
-                matched.append(row_data)
+            if mode == "match":
+                cell_val = str(row[key_idx]).strip() if key_idx < len(row) else ""
+                if cell_val != str(match_value).strip():
+                    continue
+            row_data = {"_rowNumber": row_offset + 2}  # 1-based, skip header
+            for col_name, idx in col_indices:
+                row_data[col_name] = str(row[idx]) if idx < len(row) else ""
+            matched.append(row_data)
+            if limit is not None and len(matched) >= limit:
+                break
 
-        return jsonify({"status": "success", "rows": matched}), 200
+        return jsonify({"status": "success", "mode": mode, "rows": matched}), 200
 
     except ValueError as e:
         return jsonify({"status": "error", "message": str(e)}), 400
